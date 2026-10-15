@@ -1,109 +1,93 @@
-import os
+"""Train a flower classifier on an ImageFolder dataset with train/valid/test splits.
+
+Example:
+    python train.py flowers --arch vgg16 --epochs 5 --gpu
+"""
+import argparse
+from pathlib import Path
+
 import torch
 from torch import nn, optim
-import torchvision
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-import torchvision.models as models
-from torch.autograd import Variable
-from collections import OrderedDict
-import numpy as np
-import matplotlib.pyplot as plt
-import json
-import argparse
-from PIL import Image
-import futility
-import fmodel
+from torch.utils.data import DataLoader
+from torchvision import datasets
 
-arg_parse = argparse.ArgumentParser(
-    description = 'Training Parser'
-)
-arg_parse.add_argument('data_dir', action="store", default="./flowers/")
-arg_parse.add_argument('--save_dir', action="store", default="./checkpoint.pth")
-arg_parse.add_argument('--arch', action="store", default="vgg16")
-arg_parse.add_argument('--gpu', action="store", default="gpu")
-arg_parse.add_argument('--learning_rate', action="store", default=0.001, type=float, )
-arg_parse.add_argument('--hidden_units', action="store", dest="hidden_units", default=512, type=int,)
-arg_parse.add_argument('--output_size', action="store", dest="output_size", default=102, type=int,)
-arg_parse.add_argument('--epochs', action="store", default=3, type=int)
+from model import ARCHS, EVAL_TRANSFORM, TRAIN_TRANSFORM, build_model, get_device, head_parameters, save_checkpoint
 
 
-args = arg_parse.parse_args()
-data_dir = args.data_dir
-save_dir = args.save_dir
-gpu = args.gpu
-lr = args.learning_rate
-struct = args.arch
-hidden_units = args.hidden_units
-output_size = args.hidden_units
-epochs = args.epochs
+def load_data(data_dir, batch_size=64, num_workers=2):
+    data_dir = Path(data_dir)
+    sets = {
+        "train": datasets.ImageFolder(data_dir / "train", transform=TRAIN_TRANSFORM),
+        "valid": datasets.ImageFolder(data_dir / "valid", transform=EVAL_TRANSFORM),
+        "test": datasets.ImageFolder(data_dir / "test", transform=EVAL_TRANSFORM),
+    }
+    loaders = {
+        name: DataLoader(ds, batch_size=batch_size, shuffle=(name == "train"), num_workers=num_workers)
+        for name, ds in sets.items()
+    }
+    return loaders, sets["train"].class_to_idx
 
-if torch.cuda.is_available() and gpu == 'gpu':
-    device = torch.device("cuda:0")
-else:
-    device = torch.device("cpu")
 
-def main():
-    train_loader, valid_loader, test_loader, train_datasets = futility.load_data(data_dir)
-    model, criterion = fmodel.setup_network(struct,hidden_units,output_size,lr,gpu)
-    optimizer = optim.Adam(model.classifier.parameters(), lr= 0.001)
-    
-    # Train Model
-    steps = 0
-    running_loss = 0
-    print_every = 10
-    print("Training Model:")
-    for epoch in range(epochs):
-        for inputs, labels in train_loader:
-            steps += 1
-          
-            if torch.cuda.is_available() and gpu =='gpu':
-                inputs, labels = inputs.to(device), labels.to(device)
-                model = model.to(device)
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss, correct, seen = 0.0, 0, 0
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            logits = model(inputs)
+            total_loss += criterion(logits, labels).item() * len(labels)
+            correct += (logits.argmax(dim=1) == labels).sum().item()
+            seen += len(labels)
+    return total_loss / seen, correct / seen
 
+
+def train(data_dir, save_path="checkpoint.pth", arch="vgg16", hidden_units=512, lr=1e-3,
+          epochs=5, batch_size=64, use_gpu=True, num_workers=2, pretrained=True):
+    device = get_device(use_gpu)
+    loaders, class_to_idx = load_data(data_dir, batch_size, num_workers)
+    model = build_model(arch, hidden_units, len(class_to_idx), pretrained=pretrained).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(head_parameters(model, arch), lr=lr)
+
+    print(f"Training {arch} on {device} for {epochs} epoch(s), {len(class_to_idx)} classes")
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running_loss, seen = 0.0, 0
+        for inputs, labels in loaders["train"]:
+            inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
-
-            output = model.forward(inputs)
-            loss = criterion(output, labels)
-        
+            loss = criterion(model(inputs), labels)
             loss.backward()
             optimizer.step()
+            running_loss += loss.item() * len(labels)
+            seen += len(labels)
+        valid_loss, valid_acc = evaluate(model, loaders["valid"], criterion, device)
+        print(f"Epoch {epoch}/{epochs}  train loss {running_loss / seen:.3f}  "
+              f"valid loss {valid_loss:.3f}  valid acc {valid_acc:.1%}")
 
-            running_loss += loss.item()
+    test_loss, test_acc = evaluate(model, loaders["test"], criterion, device)
+    print(f"Test loss {test_loss:.3f}  test acc {test_acc:.1%}")
+    save_checkpoint(save_path, model, arch, hidden_units, class_to_idx, epochs)
+    print(f"Saved checkpoint to {save_path}")
+    return test_acc
 
-            if steps % print_every == 0:
-                valid_loss = 0
-                accuracy = 0
-                model.eval()
-                with torch.no_grad():
-                    for inputs, labels in valid_loader:
-                        inputs, labels = inputs.to(device), labels.to(device)
 
-                        output = model.forward(inputs)
-                        batch_loss = criterion(output, labels)
-                        valid_loss += batch_loss.item()
+def main():
+    parser = argparse.ArgumentParser(description="Train a flower image classifier.")
+    parser.add_argument("data_dir", help="folder containing train/, valid/ and test/ subfolders")
+    parser.add_argument("--save_path", default="checkpoint.pth")
+    parser.add_argument("--arch", default="vgg16", choices=sorted(ARCHS))
+    parser.add_argument("--hidden_units", type=int, default=512)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--gpu", action="store_true", help="use CUDA or Apple MPS if available")
+    args = parser.parse_args()
 
-                        # Calculate accuracy
-                        ps = torch.exp(output)
-                        top_p, top_class = ps.topk(1, dim=1)
-                        equals = top_class == labels.view(*top_class.shape)
-                        accuracy += torch.mean(equals.type(torch.FloatTensor)).item()
+    train(args.data_dir, args.save_path, args.arch, args.hidden_units, args.learning_rate,
+          args.epochs, args.batch_size, args.gpu, args.num_workers)
 
-                print(f"Epoch ({epoch+1} of {epochs}) "
-                      f"Loss: {running_loss/print_every:.3f} "
-                      f"Validation Loss: {valid_loss/len(valid_loader):.3f} "
-                      f"Accuracy: {accuracy/len(valid_loader):.3f}")
-                running_loss = 0
-                model.train()
-    
-    model.class_to_idx =  train_datasets.class_to_idx
-    torch.save({'structure' :struct,
-                'hidden_units':hidden_units,
-                'learning_rate':lr,
-                'no_of_epochs':epochs,
-                'state_dict':model.state_dict(),
-                'class_to_idx':model.class_to_idx}, 
-                save_dir)
-    print("Checkpoint Has Been Saved")
+
 if __name__ == "__main__":
-    main()               
+    main()
